@@ -2,9 +2,9 @@ package web_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -15,8 +15,6 @@ import (
 	"github.com/autograde/quickfeed/web/auth"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/gorilla/sessions"
-	"github.com/markbates/goth/gothic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -38,11 +36,6 @@ func TestGetSelf(t *testing.T) {
 
 	adminUser := qtest.CreateFakeUser(t, db, 1)
 	student := qtest.CreateFakeUser(t, db, 56)
-
-	store := sessions.NewCookieStore([]byte("secret"))
-	store.Options.HttpOnly = true
-	store.Options.Secure = true
-	gothic.Store = store
 
 	lis := bufconn.Listen(bufSize)
 	bufDialer := func(context.Context, string) (net.Conn, error) {
@@ -84,27 +77,25 @@ func TestGetSelf(t *testing.T) {
 	}
 
 	for _, user := range userTest {
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
 		w := httptest.NewRecorder()
-		sess := sessions.NewSession(store, auth.SessionKey)
 
-		sess.Values[auth.UserKey] = &auth.UserSession{
-			ID:        user.id,
-			Providers: map[string]struct{}{"github": {}},
+		claims := auth.NewClaims(&pb.User{ID: user.id})
+		jwt := auth.NewJWT(claims)
+		jwtCookie, err := auth.GetJWTCookie(jwt)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if err := sess.Save(r, w); err != nil {
-			t.Errorf("sess.Save(): %v", err)
-		}
+		w.Header().Set(auth.OutgoingCookie, jwtCookie.String())
 
-		token := w.Result().Header.Get(auth.OutgoingCookie)
-		auth.Add(token, user.id)
-
-		if user.metadata {
+		cookies := w.Result().Cookies()
+		if user.metadata && len(cookies) > 0 {
 			meta := metadata.MD{}
+			cookie := cookies[0]
 			if len(user.token) > 0 {
-				token = user.token
+				cookie.Value = user.token
 			}
-			meta.Set(auth.Cookie, token)
+			cookieString := fmt.Sprintf("%s=%s", cookie.Name, cookie.Value)
+			meta.Set(auth.Cookie, cookieString)
 			ctx = metadata.NewOutgoingContext(ctx, meta)
 		}
 		gotUser, err := client.GetUser(ctx, &pb.Void{})
