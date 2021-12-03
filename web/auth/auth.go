@@ -2,17 +2,16 @@ package auth
 
 import (
 	"context"
-	"encoding/gob"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	pb "github.com/autograde/quickfeed/ag"
 	"github.com/autograde/quickfeed/database"
 	lg "github.com/autograde/quickfeed/log"
 	"github.com/gorilla/sessions"
-	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
 	"github.com/markbates/goth/gothic"
 	"go.uber.org/zap"
@@ -22,10 +21,6 @@ import (
 	"google.golang.org/grpc/status"
 	"gorm.io/gorm"
 )
-
-func init() {
-	gob.Register(&UserSession{})
-}
 
 // Session keys.
 const (
@@ -41,86 +36,20 @@ const (
 	Redirect = "redirect"
 )
 
-// UserSession holds user session information.
-type UserSession struct {
-	ID        uint64
-	Providers map[string]struct{}
-}
-
-func newUserSession(id uint64) *UserSession {
-	return &UserSession{
-		ID:        id,
-		Providers: make(map[string]struct{}),
-	}
-}
-
-func (us *UserSession) enableProvider(provider string) {
-	us.Providers[provider] = struct{}{}
-}
-
-func (us UserSession) String() string {
-	providers := ""
-	for provider := range us.Providers {
-		providers += provider + " "
-	}
-	return fmt.Sprintf("UserSession{ID: %d, Providers: %v}", us.ID, providers)
-}
-
-// map from session cookies to user IDs.
-var cookieStore = make(map[string]uint64)
-
-// Add adds cookie for userID, replacing userID's current cookie, if any.
-func Add(cookie string, userID uint64) {
-	for currentCookie, id := range cookieStore {
-		if id == userID && currentCookie != cookie {
-			delete(cookieStore, currentCookie)
-		}
-	}
-	cookieStore[cookie] = userID
-}
-
-func Get(cookie string) uint64 {
-	return cookieStore[cookie]
-}
+var manager *JWTManager = NewJWTManager()
 
 // OAuth2Logout invalidates the session for the logged in user.
 func OAuth2Logout(logger *zap.SugaredLogger) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		r := c.Request()
-		w := c.Response()
-
-		sess, err := session.Get(SessionKey, c)
-		if err != nil {
-			logger.Error(err.Error())
-			return sess.Save(r, w)
-		}
-		logger.Debug(sessionData(sess))
-
-		if i, ok := sess.Values[UserKey]; ok {
-			// If type assertions fails, the recover middleware will catch the panic and log a stack trace.
-			us := i.(*UserSession)
-			logger.Debug(us)
-			// Invalidate gothic user sessions.
-			for provider := range us.Providers {
-				sess, err := session.Get(provider+gothic.SessionName, c)
-				if err != nil {
-					logger.Error(err.Error())
-					return err
-				}
-				logger.Debug(sessionData(sess))
-
-				sess.Options.MaxAge = -1
-				sess.Values = make(map[interface{}]interface{})
-				if err := sess.Save(r, w); err != nil {
-					logger.Error(err.Error())
-				}
-			}
-		}
-		// Invalidate our user session.
-		sess.Options.MaxAge = -1
-		sess.Values = make(map[interface{}]interface{})
-		if err := sess.Save(r, w); err != nil {
-			logger.Error(err.Error())
+		if token, err := c.Cookie(JWTCookieName); err != nil {
+			// Error if user has no auth token
+		} else {
+			token.Domain = manager.Domain
+			token.Path = "/"
+			token.Expires = time.Now()
+			token.MaxAge = -1
+			c.SetCookie(token)
 		}
 		return c.Redirect(http.StatusFound, extractRedirectURL(r, Redirect))
 	}
@@ -131,27 +60,22 @@ func OAuth2Logout(logger *zap.SugaredLogger) echo.HandlerFunc {
 func PreAuth(logger *zap.SugaredLogger, db database.Database) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			sess, err := session.Get(SessionKey, c)
+			cookie, err := c.Cookie(JWTCookieName)
 			if err != nil {
 				logger.Error(err.Error())
-				if err := sess.Save(c.Request(), c.Response()); err != nil {
-					logger.Error(err.Error())
-					return err
-				}
 				return next(c)
 			}
-			logger.Debug(sessionData(sess))
 
-			if i, ok := sess.Values[UserKey]; ok {
-				// If type assertions fails, the recover middleware will catch the panic and log a stack trace.
-				us := i.(*UserSession)
-				logger.Debug(us)
-				user, err := db.GetUser(us.ID)
-				if err != nil {
+			if claims, err := manager.ParseToken(cookie.Value); err == nil && claims.ID > 0 {
+				if user, err := db.GetUser(uint64(claims.ID)); err != nil {
 					logger.Error(err.Error())
 					return OAuth2Logout(logger)(c)
+				} else {
+					logger.Debugf("User: %v", user)
 				}
-				logger.Debugf("User: %v", user)
+			} else {
+				logger.Error(err.Error())
+				return OAuth2Logout(logger)(c)
 			}
 			return next(c)
 		}
@@ -188,6 +112,7 @@ func OAuth2Login(logger *zap.SugaredLogger, db database.Database) echo.HandlerFu
 			logger.Error(err.Error())
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
+
 		var teacher int
 		if strings.HasSuffix(provider, TeacherSuffix) {
 			teacher = 1
@@ -254,62 +179,38 @@ func OAuth2Callback(logger *zap.SugaredLogger, db database.Database, scms *Scms)
 		}
 		logger.Debugf("remoteID: %v", remoteID)
 
-		// session.Get(name, context) returns an existing session, or a new session if the context does not have an existing session
-		sess, err := session.Get(SessionKey, c)
-		if err != nil {
-			logger.Error(err.Error())
-			return err
-		}
-		logger.Debugf("%s", sessionData(sess))
+		// Try to get already logged in user
+		if cookie, err := r.Cookie(JWTCookieName); err != nil {
+			//
+		} else {
+			// Parse JWT
+			claims, err := manager.ParseToken(cookie.Value)
 
-		// Try to get already logged in user.
-		// If session.Get(...) returns a new session, the check below will be nil.
-		if sess.Values[UserKey] != nil {
-			i, ok := sess.Values[UserKey]
-			if !ok {
+			// Log user out if invalid claims found
+			if err != nil || claims.ID <= 0 {
 				logger.Debug("failed to get logged in user from session; logout")
 				return OAuth2Logout(logger)(c)
 			}
-			// If type assertions fails, the recover middleware will catch the panic and log a stack trace.
-			us := i.(*UserSession)
-			logger.Debug(us)
-			// Associate user with remote identity.
+
 			if err := db.AssociateUserWithRemoteIdentity(
-				us.ID, provider, remoteID, externalUser.AccessToken,
+				uint64(claims.ID), provider, remoteID, externalUser.AccessToken,
 			); err != nil {
-				logger.Debugf("Associate failed: %d, %s, %d, %s", us.ID, provider, remoteID, externalUser.AccessToken)
+				logger.Debugf("Associate failed: %d, %s, %d, %s", claims.ID, provider, remoteID, externalUser.AccessToken)
 				logger.Error("failed to associate user with remote identity", zap.Error(err))
 				return err
 			}
-			logger.Debugf("Associate: %d, %s, %d, %s", us.ID, provider, remoteID, externalUser.AccessToken)
-
-			// Enable provider in session.
-			us.enableProvider(provider)
-			if err := sess.Save(r, w); err != nil {
-				logger.Error(err.Error())
-				return err
-			}
-			logger.Debugf("enableProvider: %v, r=%v, w=%v", provider, r, w)
-
-			if user, err := db.GetUser(us.ID); err != nil {
-				// handle
+			logger.Debugf("Associate: %d, %s, %d, %s", claims.ID, provider, remoteID, externalUser.AccessToken)
+			if user, err := db.GetUser(uint64(claims.ID)); err != nil {
 				logger.Errorf("Failed to get user: %v", err)
 			} else {
 				if ok := updateScm(c, logger, scms, user); !ok {
 					logger.Debugf("Failed to update SCM for User: %v", user)
 				}
 			}
-
-			// Enable gRPC requests for session
-			if token := extractSessionCookie(w); len(token) > 0 {
-				logger.Debugf("extractSessionCookie: %v", token)
-				Add(token, us.ID)
-			} else {
-				logger.Debugf("no session cookie found in w: %v", w)
-			}
 			logger.Debugf("Redirecting: %s", redirect)
 			return c.Redirect(http.StatusFound, redirect)
 		}
+		//logger.Debugf("%s", sessionData(sess))
 
 		remote := &pb.RemoteIdentity{
 			Provider:    provider,
@@ -358,28 +259,19 @@ func OAuth2Callback(logger *zap.SugaredLogger, db database.Database, scms *Scms)
 		}
 		logger.Debugf("Fetching full user info for %v, user: %v", remote, user)
 
-		// Register user session.
-		us := newUserSession(user.ID)
-		us.enableProvider(provider)
-		sess.Values[UserKey] = us
-		logger.Debugf("New Session: %s", us)
-		// save the session to a store in addition to adding an outgoing ('set-cookie') session cookie to the response.
-		if err := sess.Save(r, w); err != nil {
-			logger.Error(err.Error())
-			return err
-		}
-		logger.Debugf("Session.Save: %v", sess)
+		// Create user claims
+		claims := manager.NewClaims(user)
 
+		logger.Debugf("New claims: %s", claims)
+		// Generate JWT with claims
+		token := manager.NewJWT(claims)
+		// Set JWT cookie in context
+		if err := manager.setJWTCookie(token, c); err != nil {
+			logger.Debugf("Failed to set JWT cookie to context: ", zap.Error(err))
+		}
+		logger.Debug(c.Cookies())
 		if ok := updateScm(c, logger, scms, user); !ok {
 			logger.Debugf("Failed to update SCM for User: %v", user)
-		}
-
-		// Register session and associated user ID to enable gRPC requests for this session.
-		if token := extractSessionCookie(w); len(token) > 0 {
-			logger.Debugf("extractSessionCookie: %v", token)
-			Add(token, us.ID)
-		} else {
-			logger.Debugf("No session cookie found in w: %v", w)
 		}
 		logger.Debugf("Redirecting: %s", redirect)
 		return c.Redirect(http.StatusFound, redirect)
@@ -392,7 +284,7 @@ func OAuth2Callback(logger *zap.SugaredLogger, db database.Database, scms *Scms)
 func AccessControl(logger *zap.SugaredLogger, db database.Database, scms *Scms) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			sess, err := session.Get(SessionKey, c)
+			/*sess, err := session.Get(SessionKey, c)
 			if err != nil {
 				logger.Error(err.Error())
 				// Save fixes the session if it has been modified
@@ -426,7 +318,7 @@ func AccessControl(logger *zap.SugaredLogger, db database.Database, scms *Scms) 
 				return next(c)
 			}
 			c.Set(UserKey, user)
-
+			*/
 			// TODO: Add access control list.
 			// - Extract endpoint.
 			// - Verify whether the user has sufficient rights. This
@@ -514,9 +406,22 @@ func UserVerifier() grpc.UnaryServerInterceptor {
 // userValidation returns modified metadata containing a valid user.
 // An error is returned if the user is not authenticated.
 func userValidation(meta metadata.MD) (metadata.MD, error) {
+	claims := &QuickFeedClaims{}
 	for _, cookie := range meta.Get(Cookie) {
-		if user := Get(cookie); user > 0 {
-			meta.Set(UserKey, strconv.FormatUint(user, 10))
+		c := strings.Fields(cookie)
+		for _, token := range c {
+			if strings.Contains(token, "auth") {
+				jwtToken := strings.Split(token, "=")[1]
+				fmt.Println("Split: ", jwtToken, manager.Secret)
+				if tk, err := manager.ParseToken(jwtToken); err != nil {
+					return nil, status.Errorf(codes.PermissionDenied, "Permission denied")
+				} else {
+					claims = tk
+				}
+			}
+		}
+		if claims.ID > 0 {
+			meta.Set(UserKey, fmt.Sprint(claims.ID))
 			return meta, nil
 		}
 	}

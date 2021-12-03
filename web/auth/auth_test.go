@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	pb "github.com/autograde/quickfeed/ag"
@@ -47,49 +48,31 @@ func TestOAuth2Logout(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, logoutURL, nil)
 	w := httptest.NewRecorder()
 
-	store := newStore()
-	gothic.Store = store
-
 	e := echo.New()
 	c := e.NewContext(r, w)
 
-	fakeSession := auth.FakeSession{}
-	s, _ := store.Get(r, fakeSessionName)
-	s.Values[fakeSessionKey] = fakeSession.Marshal()
-	if err := s.Save(r, w); err != nil {
+	if err := login(c); err != nil {
 		t.Error(err)
-	}
-
-	if err := store.login(c); err != nil {
-		t.Error(err)
-	}
-
-	ns := len(store.store[r].Values)
-	// Want gothic session and user session.
-	if ns != 2 {
-		t.Errorf("have %d sessions want %d", ns, 2)
 	}
 
 	authHandler := auth.OAuth2Logout(logger(t))
-	withSession := session.Middleware(store)(authHandler)
-
-	if err := withSession(c); err != nil {
+	if err := authHandler(c); err != nil {
 		t.Error(err)
 	}
 
-	ns = len(store.store[r].Values)
-	// Sessions should be cleared.
-	if ns != 0 {
-		t.Errorf("have %d sessions want %d", ns, 0)
+	if cookie := c.Response().Header().Get(auth.OutgoingCookie); len(cookie) > 0 {
+		if !strings.HasPrefix(cookie, auth.JWTCookieName) {
+			t.Error("Response contains a Set-Cookie header for a cookie other than 'auth'.")
+		}
+	} else {
+		t.Error("Response did not update any cookies.")
 	}
+	// TODO: Parse request and response header cookies and verify that response does in fact expire the cookie.
 }
 
 func TestOAuth2LoginRedirect(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, authURL, nil)
 	w := httptest.NewRecorder()
-
-	store := newStore()
-	gothic.Store = store
 
 	e := echo.New()
 	c := e.NewContext(r, w)
@@ -98,20 +81,15 @@ func TestOAuth2LoginRedirect(t *testing.T) {
 	defer cleanup()
 
 	authHandler := auth.OAuth2Login(logger(t), db)
-	withSession := session.Middleware(store)(authHandler)
-	if err := withSession(c); err != nil {
+	if err := authHandler(c); err != nil {
 		t.Error(err)
 	}
-
 	assertCode(t, w.Code, http.StatusTemporaryRedirect)
 }
 
 func TestOAuth2CallbackBadRequest(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, authURL, nil)
 	w := httptest.NewRecorder()
-
-	store := newStore()
-	gothic.Store = store
 
 	e := echo.New()
 	c := e.NewContext(r, w)
@@ -120,13 +98,11 @@ func TestOAuth2CallbackBadRequest(t *testing.T) {
 	defer cleanup()
 
 	authHandler := auth.OAuth2Callback(logger(t), db, auth.NewScms())
-	withSession := session.Middleware(store)(authHandler)
-	err := withSession(c)
+	err := authHandler(c)
 	httpErr, ok := err.(*echo.HTTPError)
 	if !ok {
 		t.Errorf("unexpected error type: %v", reflect.TypeOf(err))
 	}
-
 	assertCode(t, httpErr.Code, http.StatusBadRequest)
 }
 
@@ -157,16 +133,13 @@ func testPreAuthLoggedIn(t *testing.T, haveSession, existingUser bool, newProvid
 	r := httptest.NewRequest(http.MethodGet, authURL, nil)
 	w := httptest.NewRecorder()
 
-	store := newStore()
-	gothic.Store = store
-
 	e := echo.New()
 	rou := e.Router()
 	rou.Add("GET", "/:provider", func(echo.Context) error { return nil })
 	c := e.NewContext(r, w)
 
 	if haveSession {
-		if err := store.login(c); err != nil {
+		if err := login(c); err != nil {
 			t.Error(err)
 		}
 	}
@@ -187,9 +160,8 @@ func testPreAuthLoggedIn(t *testing.T, haveSession, existingUser bool, newProvid
 	}
 
 	authHandler := auth.PreAuth(logger(t), db)(func(c echo.Context) error { return nil })
-	withSession := session.Middleware(store)(authHandler)
 
-	if err := withSession(c); err != nil {
+	if err := authHandler(c); err != nil {
 		t.Error(err)
 	}
 
@@ -221,16 +193,6 @@ func TestOAuth2LoginAuthenticated(t *testing.T) {
 	qv.Set(auth.State, r.URL.Query().Get(auth.Redirect))
 	r.URL.RawQuery = qv.Encode()
 
-	store := newStore()
-	gothic.Store = store
-
-	fakeSession := auth.FakeSession{ID: userID}
-	s, _ := store.Get(r, fakeSessionName)
-	s.Values[fakeSessionKey] = fakeSession.Marshal()
-	if err := s.Save(r, w); err != nil {
-		t.Error(err)
-	}
-
 	_, err := gothic.GetAuthURL(w, r)
 	if err != nil {
 		t.Fatal(err)
@@ -243,9 +205,8 @@ func TestOAuth2LoginAuthenticated(t *testing.T) {
 	defer cleanup()
 
 	authHandler := auth.OAuth2Login(logger(t), db)
-	withSession := session.Middleware(store)(authHandler)
 
-	if err := withSession(c); err != nil {
+	if err := authHandler(c); err != nil {
 		t.Error(err)
 	}
 
@@ -297,7 +258,7 @@ func testOAuth2Callback(t *testing.T, existingUser, haveSession bool) {
 	c := e.NewContext(r, w)
 
 	if haveSession {
-		if err := store.login(c); err != nil {
+		if err := login(c); err != nil {
 			t.Error(err)
 		}
 	}
@@ -316,9 +277,8 @@ func testOAuth2Callback(t *testing.T, existingUser, haveSession bool) {
 	}
 
 	authHandler := auth.OAuth2Callback(logger(t), db, auth.NewScms())
-	withSession := session.Middleware(store)(authHandler)
 
-	if err := withSession(c); err != nil {
+	if err := authHandler(c); err != nil {
 		t.Error(err)
 	}
 
@@ -368,7 +328,7 @@ func TestAccessControl(t *testing.T) {
 		t.Error(err)
 	}
 
-	if err := store.login(c); err != nil {
+	if err := login(c); err != nil {
 		t.Error(err)
 	}
 
@@ -398,16 +358,22 @@ func newStore() *testStore {
 	}
 }
 
-func (ts testStore) login(c echo.Context) error {
-	s, err := ts.Get(c.Request(), auth.SessionKey)
+func login(c echo.Context) error {
+	manager := auth.JWTManager{Secret: "", Domain: testDomain}
+	claims := manager.NewClaims(&pb.User{ID: 1})
+	token := manager.NewJWT(claims)
+	/*err := j.setJWTCookie(token, context)
+	if err != nil {
+		return err
+	}*/
+	cookie, err := manager.GetJWTCookie(token)
 	if err != nil {
 		return err
 	}
-	s.Values[auth.UserKey] = &auth.UserSession{
-		ID:        1,
-		Providers: map[string]struct{}{"github": {}},
-	}
-	return s.Save(c.Request(), c.Response())
+	r := c.Request()
+	r.Header.Add(auth.Cookie, cookie.String())
+
+	return nil
 }
 
 func (ts testStore) Get(r *http.Request, name string) (*sessions.Session, error) {

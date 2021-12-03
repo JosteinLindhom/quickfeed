@@ -2,6 +2,7 @@ package web_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"testing"
@@ -19,7 +20,6 @@ import (
 
 const (
 	grpcAddr = ":9090"
-	token    = "some-secret-string"
 	// same as quickfeed root user
 	botUserID = 1
 	userName  = "meling"
@@ -48,7 +48,14 @@ func TestGrpcAuth(t *testing.T) {
 	defer conn.Close()
 
 	client := pb.NewAutograderServiceClient(conn)
-
+	manager := auth.NewJWTManager()
+	claims := manager.NewClaims(&pb.User{ID: botUserID})
+	jwt := manager.NewJWT(claims)
+	jwtString, err := manager.GetJWTString(jwt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := fmt.Sprintf("%s=%s", auth.JWTCookieName, jwtString)
 	// create request context with the helpbot's secret token
 	reqCtx := metadata.NewOutgoingContext(ctx,
 		metadata.New(map[string]string{auth.Cookie: token}),
@@ -70,14 +77,6 @@ func TestGrpcAuth(t *testing.T) {
 }
 
 func fillDatabase(t *testing.T, db database.Database) {
-	// Add secret token for the helpbot application (to allow it to invoke gRPC methods)
-	auth.Add(token, botUserID)
-
-	// Check that token was stored and maps to correct user
-	checkCookie := auth.Get(token)
-	if checkCookie != botUserID {
-		t.Errorf("Expected %v, got %v\n", botUserID, checkCookie)
-	}
 	admin := qtest.CreateUser(t, db, 1, &pb.User{Login: "admin"})
 	course := &pb.Course{
 		ID:              1,
